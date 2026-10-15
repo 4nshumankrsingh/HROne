@@ -243,6 +243,11 @@ def create_indexes() -> None:
     employees_col.create_index([("department", ASCENDING), ("emp_code", ASCENDING)], name="dept_emp_code")
     # punch-out: latest record of an employee with punch_in <= t.
     logs_col.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_punch_in")
+    # GET /attendance: sort (date desc, emp_code asc), with or without a status filter.
+    logs_col.create_index([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_emp")
+    logs_col.create_index(
+        [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)], name="status_date_emp"
+    )
     # More indexes are added in later phases, driven by explain() output.
 
 
@@ -380,3 +385,46 @@ def punch_out(body: PunchOutRequest):
         raise HTTPException(409, "already punched out")
     rec.update({"punch_out": ts, **derived})
     return record_to_api(rec)
+
+# --- attendance: list ------------------------------------------------------
+StatusLit = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+def build_attendance_filter(
+    emp_code: Optional[str], date_from: Optional[str], date_to: Optional[str], status: Optional[str]
+) -> dict[str, Any]:
+    q: dict[str, Any] = {}
+    if emp_code is not None:
+        q["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        rng: dict[str, str] = {}
+        if date_from is not None:
+            rng["$gte"] = date_from
+        if date_to is not None:
+            rng["$lte"] = date_to
+        q["date"] = rng
+    if status is not None:
+        q["status"] = status
+    return q
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[StatusLit] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(422, "date_from must not be after date_to")
+    q = build_attendance_filter(emp_code, date_from, date_to, status)
+    total = logs_col.count_documents(q)
+    skip = (page - 1) * page_size
+    items: list[dict] = []
+    if skip < total:
+        cur = logs_col.find(q).sort(ATTENDANCE_SORT).skip(skip).limit(page_size)
+        items = [record_to_api(d) for d in cur]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}

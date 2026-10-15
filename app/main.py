@@ -16,12 +16,13 @@ import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from pydantic import AfterValidator, Field, StringConstraints
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints, model_validator
 from pymongo import ASCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # --------------------------------------------------------------------------- #
 # 1. Config & database
@@ -32,7 +33,7 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
 
 # tz_aware=True: PyMongo returns UTC-aware datetimes instead of naive ones.
-client = MongoClient(MONGO_URI, tz_aware=True)
+client = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=10_000)
 db = client[MONGO_DB]
 employees_col = db["employees"]
 logs_col = db["attendance_logs"]
@@ -66,10 +67,10 @@ def _check_real_date(value: str) -> str:
 # Epoch milliseconds: strict int (rejects floats/strings/bools), seconds-looking values rejected by `ge`.
 EpochMs = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
 DateStr = Annotated[
-    str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$"), AfterValidator(_check_real_date)
+    str, StringConstraints(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_check_real_date)
 ]
-MonthStr = Annotated[str, StringConstraints(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")]
-HHMM = Annotated[str, StringConstraints(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]
+MonthStr = Annotated[str, StringConstraints(pattern=r"^[0-9]{4}-(0[1-9]|1[0-2])$")]
+HHMM = Annotated[str, StringConstraints(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")]
 
 
 # --------------------------------------------------------------------------- #
@@ -238,6 +239,8 @@ def create_indexes() -> None:
     employees_col.create_index([("emp_code", ASCENDING)], unique=True, name="uniq_emp_code")
     # One record per (emp_code, date): the guard that makes concurrent punch-ins race-safe.
     logs_col.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uniq_emp_date")
+    # GET /employees: department filter + emp_code sort.
+    employees_col.create_index([("department", ASCENDING), ("emp_code", ASCENDING)], name="dept_emp_code")
     # More indexes are added in later phases, driven by explain() output.
 
 
@@ -253,3 +256,89 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 # --------------------------------------------------------------------------- #
 # 6. Models and endpoints  (added in the next phases)
 # --------------------------------------------------------------------------- #
+
+class EmployeeCreate(BaseModel):
+    emp_code: Annotated[str, StringConstraints(pattern=r"^EMP[0-9]{4,6}$")]
+    name: Annotated[str, StringConstraints(min_length=1, max_length=100)]
+    email: Annotated[str, StringConstraints(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")]
+    department: Annotated[str, StringConstraints(min_length=1, max_length=50)]
+    shift_start: HHMM = "09:30"
+    shift_end: HHMM = "18:30"
+    joined_on: DateStr
+
+    @model_validator(mode="after")
+    def _shifts_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
+
+
+# --- system ----------------------------------------------------------------
+@app.get("/health")
+def health():
+    try:
+        client.admin.command("ping")
+    except PyMongoError:
+        raise HTTPException(503, "database unavailable")
+    return {"status": "ok"}
+
+
+# --- employees -------------------------------------------------------------
+@app.post("/employees", status_code=201)
+def create_employee(body: EmployeeCreate):
+    doc = body.model_dump()
+    doc["created_at"] = now_utc()
+    try:
+        employees_col.insert_one(doc)          # uniqueness enforced by the unique index
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return employee_to_api(doc)
+
+
+@app.get("/employees")
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q: dict[str, Any] = {}
+    if department is not None:
+        q["department"] = department
+    total = employees_col.count_documents(q)
+    skip = (page - 1) * page_size
+    items: list[dict] = []
+    if skip < total:
+        cur = employees_col.find(q).sort("emp_code", ASCENDING).skip(skip).limit(page_size)
+        items = [employee_to_api(d) for d in cur]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+# --- attendance: punch-in --------------------------------------------------
+class PunchInRequest(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+
+@app.post("/attendance/punch-in", status_code=201)
+def punch_in(body: PunchInRequest):
+    emp = employees_col.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    ts = truncate_seconds(ms_to_dt(body.punched_at)) if body.punched_at is not None else now_utc()
+    day = attendance_date(ts, emp["shift_start"], emp["shift_end"])
+    derived = derive_fields(body.status, ts, None, day, emp["shift_start"], emp["shift_end"])
+    doc = {
+        "emp_code": body.emp_code,
+        "date": day,
+        "status": body.status,
+        "punch_in": ts,
+        "punch_out": None,
+        **derived,
+        "history": [],
+    }
+    try:
+        logs_col.insert_one(doc)               # unique (emp_code, date) index decides the race
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return record_to_api(doc)

@@ -12,6 +12,7 @@ Everything lives in this one file, in labelled sections:
   5. Startup (index creation)
   6. Models and endpoints
   7. Analytics aggregation pipelines and endpoints (phases 10-13)
+  8. Admin: explain endpoint (phase 14)
 """
 import os
 from calendar import monthrange
@@ -21,7 +22,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Any, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import AfterValidator, BaseModel, Field, StringConstraints, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -918,3 +919,152 @@ def department_trend(
                             else round_half_up(r["moving_avg_7d"], 4),
     } for r in rows]
     return {"department": department, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# 8. Admin: explain endpoint (phase 14)
+# --------------------------------------------------------------------------- #
+EXPLAINABLE = (
+    "attendance_list",
+    "employee_monthly",
+    "department_summary",
+    "late_leaderboard",
+    "department_trend",
+)
+
+
+def _explain_cmd(collection: str, query: dict, *, sort=None, skip=0, limit=0,
+                 pipeline=None) -> dict:
+    """Build the explain command for the given operation."""
+    if pipeline is not None:
+        return {
+            "explain": {
+                "aggregate": collection,
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
+    find_cmd: dict[str, Any] = {"find": collection, "filter": query}
+    if sort:
+        find_cmd["sort"] = dict(sort)
+    if skip:
+        find_cmd["skip"] = skip
+    if limit:
+        find_cmd["limit"] = limit
+    return {"explain": find_cmd, "verbosity": "executionStats"}
+
+
+def _explain_attendance_list(req: Request) -> tuple[str, dict]:
+    """GET /attendance's main query: find + sort + skip + limit."""
+    qp = req.query_params
+    emp_code = qp.get("emp_code")
+    date_from = qp.get("date_from")
+    date_to = qp.get("date_to")
+    status = qp.get("status")
+
+    # Validate the same way the real endpoint does
+    if date_from is not None:
+        DateStr(date_from)
+    if date_to is not None:
+        DateStr(date_to)
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must not be after date_to")
+    if status is not None and status not in ("PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"):
+        raise HTTPException(422, "invalid status")
+
+    try:
+        page = int(qp.get("page", 1))
+        page_size = int(qp.get("page_size", 20))
+    except ValueError:
+        raise HTTPException(422, "page and page_size must be integers")
+    if page < 1 or not (1 <= page_size <= 100):
+        raise HTTPException(422, "invalid pagination")
+
+    query = build_attendance_filter(emp_code, date_from, date_to, status)
+    skip = (page - 1) * page_size
+    cmd = _explain_cmd("attendance_logs", query, sort=ATTENDANCE_SORT,
+                       skip=skip, limit=page_size)
+    return "attendance_logs", cmd
+
+
+def _explain_employee_monthly(req: Request) -> tuple[str, dict]:
+    emp_code = req.query_params.get("emp_code")
+    month = req.query_params.get("month")
+    if not emp_code or not month:
+        raise HTTPException(422, "emp_code and month are required")
+    MonthStr(month)
+    first, last = _month_bounds(month)
+    pipeline = _employee_monthly_pipeline(emp_code, first.isoformat(), last.isoformat())
+    return "attendance_logs", _explain_cmd("attendance_logs", {}, pipeline=pipeline)
+
+
+def _explain_department_summary(req: Request) -> tuple[str, dict]:
+    month = req.query_params.get("month")
+    if not month:
+        raise HTTPException(422, "month is required")
+    MonthStr(month)
+    department = req.query_params.get("department")
+    first, last = _month_bounds(month)
+    pipeline = _department_summary_pipeline(first.isoformat(), last.isoformat(), department)
+    return "employees", _explain_cmd("employees", {}, pipeline=pipeline)
+
+
+def _explain_late_leaderboard(req: Request) -> tuple[str, dict]:
+    month = req.query_params.get("month")
+    if not month:
+        raise HTTPException(422, "month is required")
+    MonthStr(month)
+    try:
+        limit = int(req.query_params.get("limit", 10))
+    except ValueError:
+        raise HTTPException(422, "limit must be an integer")
+    if not (1 <= limit <= 50):
+        raise HTTPException(422, "limit out of range")
+    department = req.query_params.get("department")
+    first, last = _month_bounds(month)
+    pipeline = _late_leaderboard_pipeline(first.isoformat(), last.isoformat(), limit, department)
+    return "attendance_logs", _explain_cmd("attendance_logs", {}, pipeline=pipeline)
+
+
+def _explain_department_trend(req: Request) -> tuple[str, dict]:
+    department = req.query_params.get("department")
+    from_ = req.query_params.get("from")
+    to = req.query_params.get("to")
+    if not department or not from_ or not to:
+        raise HTTPException(422, "department, from and to are required")
+    DateStr(from_)
+    DateStr(to)
+    from_d = date.fromisoformat(from_)
+    to_d = date.fromisoformat(to)
+    if to_d < from_d or (to_d - from_d).days + 1 > 92:
+        raise HTTPException(422, "invalid date range")
+    pipeline = _department_trend_pipeline(department, from_, to)
+    return "employees", _explain_cmd("employees", {}, pipeline=pipeline)
+
+
+_EXPLAIN_DISPATCH = {
+    "attendance_list":   _explain_attendance_list,
+    "employee_monthly":  _explain_employee_monthly,
+    "department_summary": _explain_department_summary,
+    "late_leaderboard":  _explain_late_leaderboard,
+    "department_trend":  _explain_department_trend,
+}
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(endpoint: str, request: Request):
+    if endpoint not in EXPLAINABLE:
+        raise HTTPException(422, f"endpoint must be one of {EXPLAINABLE}")
+
+    collection, cmd = _EXPLAIN_DISPATCH[endpoint](request)
+    try:
+        result = db.command(cmd)
+    except PyMongoError as e:
+        raise HTTPException(500, f"explain failed: {e}")
+
+    return {
+        "endpoint": endpoint,
+        "collection": collection,
+        "explain": result,
+    }

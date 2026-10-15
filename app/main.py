@@ -21,7 +21,7 @@ from typing import Annotated, Any, Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, Field, StringConstraints, model_validator
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # --------------------------------------------------------------------------- #
@@ -241,6 +241,8 @@ def create_indexes() -> None:
     logs_col.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uniq_emp_date")
     # GET /employees: department filter + emp_code sort.
     employees_col.create_index([("department", ASCENDING), ("emp_code", ASCENDING)], name="dept_emp_code")
+    # punch-out: latest record of an employee with punch_in <= t.
+    logs_col.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_punch_in")
     # More indexes are added in later phases, driven by explain() output.
 
 
@@ -342,3 +344,39 @@ def punch_in(body: PunchInRequest):
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
     return record_to_api(doc)
+
+# --- attendance: punch-out -------------------------------------------------
+class PunchOutRequest(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutRequest):
+    emp = employees_col.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = truncate_seconds(ms_to_dt(body.punched_at)) if body.punched_at is not None else now_utc()
+
+    # Most recent record whose punch_in is at or before punched_at (works across midnight).
+    rec = logs_col.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", DESCENDING)]
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+    pin = rec["punch_in"]
+    if ts <= pin or (ts - pin).total_seconds() > MAX_SHIFT_SECONDS:
+        raise HTTPException(422, "punched_at must be after punch_in and within 24 hours of it")
+
+    derived = derive_fields(rec["status"], pin, ts, rec["date"], emp["shift_start"], emp["shift_end"])
+    # Compare-and-set: only close the record if it is still open and unchanged.
+    res = logs_col.update_one(
+        {"_id": rec["_id"], "punch_out": None, "punch_in": pin},
+        {"$set": {"punch_out": ts, **derived}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(409, "already punched out")
+    rec.update({"punch_out": ts, **derived})
+    return record_to_api(rec)

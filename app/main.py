@@ -10,9 +10,11 @@ Everything lives in this one file, in labelled sections:
   3. Time, rounding and shift helpers (pure functions, unit-tested in dev/)
   4. Serialisers (Mongo document -> API JSON)
   5. Startup (index creation)
-  6. Models and endpoints (added phase by phase)
+  6. Models and endpoints
+  7. Analytics aggregation pipelines and endpoints (phases 10-13)
 """
 import os
+from calendar import monthrange
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -51,6 +53,7 @@ HALF_DAY_THRESHOLD = Decimal("4.50")  # R5
 MAX_SHIFT_SECONDS = 24 * 3600      # punch-out / correction window
 
 PRESENCE_STATUSES = ("PRESENT", "WFH", "ON_DUTY")   # R6
+PRESENCE_LIST = ["PRESENT", "WFH", "ON_DUTY"]       # list form, for MongoDB $in
 ALL_STATUSES = PRESENCE_STATUSES + ("ABSENT", "LEAVE")
 
 
@@ -248,7 +251,8 @@ def create_indexes() -> None:
     logs_col.create_index(
         [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)], name="status_date_emp"
     )
-    # More indexes are added in later phases, driven by explain() output.
+    # Analytics: date-range scans for the monthly / leaderboard / trend pipelines.
+    logs_col.create_index([("date", ASCENDING), ("emp_code", ASCENDING)], name="date_emp_asc")
 
 
 @asynccontextmanager
@@ -261,7 +265,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 # --------------------------------------------------------------------------- #
-# 6. Models and endpoints  (added in the next phases)
+# 6. Models and endpoints
 # --------------------------------------------------------------------------- #
 
 class EmployeeCreate(BaseModel):
@@ -319,6 +323,7 @@ def list_employees(
         items = [employee_to_api(d) for d in cur]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
+
 # --- attendance: punch-in --------------------------------------------------
 class PunchInRequest(BaseModel):
     emp_code: str
@@ -349,6 +354,7 @@ def punch_in(body: PunchInRequest):
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
     return record_to_api(doc)
+
 
 # --- attendance: punch-out -------------------------------------------------
 class PunchOutRequest(BaseModel):
@@ -385,6 +391,7 @@ def punch_out(body: PunchOutRequest):
         raise HTTPException(409, "already punched out")
     rec.update({"punch_out": ts, **derived})
     return record_to_api(rec)
+
 
 # --- attendance: list ------------------------------------------------------
 StatusLit = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
@@ -428,6 +435,7 @@ def list_attendance(
         cur = logs_col.find(q).sort(ATTENDANCE_SORT).skip(skip).limit(page_size)
         items = [record_to_api(d) for d in cur]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
+
 
 # --- attendance: regularize (manual correction) ----------------------------
 class RegularizeRequest(BaseModel):
@@ -500,3 +508,413 @@ def regularize_attendance(emp_code: str, date: DateStr, body: RegularizeRequest)
     rec.update(new_vals)
     rec["history"] = old_history + [entry]
     return record_to_api(rec)
+
+
+# --------------------------------------------------------------------------- #
+# 7. Analytics aggregation pipelines and endpoints  (phases 10-13)
+# --------------------------------------------------------------------------- #
+def _month_bounds(month: str) -> tuple[date, date]:
+    """YYYY-MM -> (first, last) IST calendar dates of that month."""
+    y, m = int(month[:4]), int(month[5:7])
+    return date(y, m, 1), date(y, m, monthrange(y, m)[1])
+
+
+def _count_weekdays(a: date, b: date) -> int:
+    """Mon-Fri days in [a, b] inclusive (R7)."""
+    if a > b:
+        return 0
+    return sum(1 for i in range((b - a).days + 1)
+               if (a + timedelta(days=i)).weekday() < 5)
+
+
+# --- Phase 10: employee monthly -------------------------------------------- #
+def _employee_monthly_pipeline(emp_code: str, month_start: str, month_end: str) -> list[dict]:
+    return [
+        {"$match": {"emp_code": emp_code,
+                    "date": {"$gte": month_start, "$lte": month_end}}},
+        {"$addFields": {
+            "_dow":      {"$dayOfWeek": {"$toDate": "$date"}},   # 1=Sun .. 7=Sat
+            "_presence": {"$cond": [
+                {"$in": ["$status", PRESENCE_LIST]},
+                {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+                0,
+            ]},
+            "_late": {"$ifNull": ["$late_minutes", 0]},
+        }},
+        {"$group": {
+            "_id": None,
+            # present_days: presence weight, but only on Mon-Fri (R7)
+            "present_days": {"$sum": {"$cond": [
+                {"$and": [{"$gte": ["$_dow", 2]}, {"$lte": ["$_dow", 6]}]},
+                "$_presence", 0,
+            ]}},
+            "leave_days":             {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count":             {"$sum": {"$cond": [{"$gt": ["$_late", 0]}, 1, 0]}},
+            "total_late_minutes":     {"$sum": {"$cond": [{"$gt": ["$_late", 0]}, "$_late", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: MonthStr):
+    emp = employees_col.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    first, last = _month_bounds(month)
+    joined = date.fromisoformat(emp["joined_on"])
+    start = max(first, joined)                              # R7: count from joined_on
+    working_days = _count_weekdays(start, last)
+
+    rows = list(logs_col.aggregate(
+        _employee_monthly_pipeline(emp_code, first.isoformat(), last.isoformat())
+    ))
+    a = rows[0] if rows else {}
+
+    present_dec = Decimal(str(a.get("present_days", 0)))
+    present_days = round_half_up(present_dec, 2)
+    attendance_pct = (
+        None if working_days == 0
+        else round_half_up(present_dec * 100 / Decimal(working_days), 2)
+    )
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": int(a.get("leave_days", 0)),
+        "late_count": int(a.get("late_count", 0)),
+        "total_late_minutes": int(a.get("total_late_minutes", 0)),
+        "total_overtime_minutes": int(a.get("total_overtime_minutes", 0)),
+        "attendance_pct": attendance_pct,
+    }
+
+
+# --- Phase 11: department summary (cross-collection) ----------------------- #
+def _department_summary_pipeline(
+    month_start: str, month_end: str, department: Optional[str]
+) -> list[dict]:
+    emp_match: dict[str, Any] = {"joined_on": {"$lte": month_end}}   # R9
+    if department is not None:
+        emp_match["department"] = department
+
+    return [
+        {"$match": emp_match},
+        # Group employees by department to establish headcount AND member list
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            "emp_codes": {"$push": "$emp_code"},
+        }},
+        # Cross-collection: pull each department's logs for the month
+        {"$lookup": {
+            "from": "attendance_logs",
+            "let":  {"codes": "$emp_codes"},
+            "pipeline": [
+                {"$match": {"date": {"$gte": month_start, "$lte": month_end}}},
+                {"$match": {"$expr": {"$in": ["$emp_code", "$$codes"]}}},
+                {"$addFields": {
+                    "_dow": {"$dayOfWeek": {"$toDate": "$date"}},
+                    "_presence": {"$cond": [
+                        {"$in": ["$status", PRESENCE_LIST]},
+                        {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+                        0,
+                    ]},
+                    "_late": {"$ifNull": ["$late_minutes", 0]},
+                }},
+            ],
+            "as": "logs",
+        }},
+        {"$project": {
+            "_id": 0,
+            "department": "$_id",
+            "headcount": 1,
+            "present_days": {"$sum": {"$map": {
+                "input": "$logs", "as": "l",
+                "in": {"$cond": [
+                    {"$and": [{"$gte": ["$$l._dow", 2]}, {"$lte": ["$$l._dow", 6]}]},
+                    "$$l._presence", 0,
+                ]},
+            }}},
+            # avg over records (not over per-employee averages), presence status & work_hours != null
+            "avg_work_hours": {"$let": {
+                "vars": {"hours": {"$filter": {
+                    "input": "$logs", "as": "l",
+                    "cond": {"$and": [
+                        {"$in": ["$$l.status", PRESENCE_LIST]},
+                        {"$ne": ["$$l.work_hours", None]},
+                    ]},
+                }}},
+                "in": {"$cond": [
+                    {"$gt": [{"$size": "$$hours"}, 0]},
+                    {"$divide": [{"$sum": "$$hours.work_hours"},
+                                 {"$size": "$$hours"}]},
+                    None,
+                ]},
+            }},
+            "late_count":         {"$sum": {"$map": {"input": "$logs", "as": "l",
+                "in": {"$cond": [{"$gt": ["$$l._late", 0]}, 1, 0]}}}},
+            "total_late_minutes": {"$sum": {"$map": {"input": "$logs", "as": "l",
+                "in": {"$cond": [{"$gt": ["$$l._late", 0]}, "$$l._late", 0]}}}},
+            "leave_count":        {"$sum": {"$map": {"input": "$logs", "as": "l",
+                "in": {"$cond": [{"$eq": ["$$l.status", "LEAVE"]}, 1, 0]}}}},
+            "on_duty_count":      {"$sum": {"$map": {"input": "$logs", "as": "l",
+                "in": {"$cond": [{"$eq": ["$$l.status", "ON_DUTY"]}, 1, 0]}}}},
+        }},
+        {"$sort": {"department": 1}},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: MonthStr, department: Optional[str] = None):
+    first, last = _month_bounds(month)
+    rows = list(employees_col.aggregate(
+        _department_summary_pipeline(first.isoformat(), last.isoformat(), department)
+    ))
+    items = [{
+        "department":         r["department"],
+        "headcount":          int(r["headcount"]),
+        "present_days":       round_half_up(Decimal(str(r.get("present_days", 0))), 2),
+        "avg_work_hours":     None if r.get("avg_work_hours") is None
+                              else round_half_up(r["avg_work_hours"], 2),
+        "late_count":         int(r.get("late_count", 0)),
+        "total_late_minutes": int(r.get("total_late_minutes", 0)),
+        "leave_count":        int(r.get("leave_count", 0)),
+        "on_duty_count":      int(r.get("on_duty_count", 0)),
+    } for r in rows]
+    return {"month": month, "items": items}
+
+
+# --- Phase 12: late leaderboard (competition ranking) ---------------------- #
+def _late_leaderboard_pipeline(
+    month_start: str, month_end: str, limit: int, department: Optional[str]
+) -> list[dict]:
+    pipeline: list[dict] = [
+        {"$match": {"date": {"$gte": month_start, "$lte": month_end}}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [
+                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0,
+            ]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        # Drop orphan logs (logs whose employee does not exist)
+        {"$lookup": {
+            "from": "employees",
+            "localField": "_id", "foreignField": "emp_code",
+            "as": "emp",
+        }},
+        {"$unwind": "$emp"},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})
+
+    pipeline.extend([
+        # Competition ranking: ties share a rank, next rank is skipped (1,1,3,...).
+        # Ties are defined by total_late_minutes alone -> sortBy must contain ONLY that field.
+        {"$setWindowFields": {
+            "sortBy": {"total_late_minutes": -1},
+            "output": {"rank": {"$rank": {}}},
+        }},
+        # limit applies AFTER ranking: return every row whose rank <= limit
+        {"$match": {"rank": {"$lte": limit}}},
+        # Deterministic row order: total desc, then emp_code asc (tie-break for output only)
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$emp.name",
+            "department": "$emp.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ])
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: MonthStr,
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    first, last = _month_bounds(month)
+    rows = list(logs_col.aggregate(
+        _late_leaderboard_pipeline(first.isoformat(), last.isoformat(), limit, department)
+    ))
+    items = [{
+        "rank":               int(r["rank"]),
+        "emp_code":           r["emp_code"],
+        "name":               r["name"],
+        "department":         r["department"],
+        "total_late_minutes": int(r["total_late_minutes"]),
+        "late_count":         int(r["late_count"]),
+    } for r in rows]
+    return {"month": month, "items": items}
+
+
+# --- Phase 13: department trend (gap-filled daily series) ------------------ #
+def _department_trend_pipeline(
+    department: str, from_str: str, to_str: str
+) -> list[dict]:
+    from_d = date.fromisoformat(from_str)
+    to_d = date.fromisoformat(to_str)
+    from_dt = datetime(from_d.year, from_d.month, from_d.day, tzinfo=UTC)
+    to_dt = datetime(to_d.year, to_d.month, to_d.day, tzinfo=UTC)
+    # Densify upper bound is exclusive in some MongoDB versions, inclusive in others.
+    # Add a day and filter afterwards, so the boundary doesn't matter.
+    to_dt_excl = to_dt + timedelta(days=1)
+
+    return [
+        # ---- 1. presence + late counts per IST date (logs -> employees join) ---
+        {"$match": {"date": {"$gte": from_str, "$lte": to_str}}},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "emp_code", "foreignField": "emp_code",
+            "as": "emp",
+        }},
+        {"$unwind": "$emp"},                              # drops orphan logs
+        {"$match": {"emp.department": department}},
+        {"$group": {
+            "_id": {"$toDate": "$date"},                  # Date, not string, so $densify can walk it
+            "present_count": {"$sum": {"$cond": [
+                {"$in": ["$status", PRESENCE_LIST]},
+                {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+                0,
+            ]}},
+            "late_count": {"$sum": {"$cond": [
+                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0,
+            ]}},
+        }},
+        {"$project": {
+            "present_count": 1,
+            "late_count": 1,
+            "_priority": {"$literal": 1},                 # real document beats sentinel
+        }},
+        # ---- 2. Inject a seed at `from_dt` so $densify has input even when there are no logs.
+        #          The `_priority` field lets us drop the seed if a real document exists for from_dt.
+        {"$unionWith": {
+            "coll": "employees",
+            "pipeline": [
+                {"$limit": 1},
+                {"$project": {
+                    "_id":           {"$literal": from_dt},
+                    "present_count": {"$literal": 0},
+                    "late_count":    {"$literal": 0},
+                    "_priority":     {"$literal": 0},
+                }},
+            ],
+        }},
+        {"$sort": {"_id": 1, "_priority": -1}},
+        {"$group": {
+            "_id": "$_id",
+            "present_count": {"$first": "$present_count"},
+            "late_count":    {"$first": "$late_count"},
+        }},
+        # ---- 3. Gap-fill: exactly one row per calendar day in the range
+        {"$densify": {
+            "field": "_id",
+            "range": {"step": 1, "unit": "day", "bounds": [from_dt, to_dt_excl]},
+        }},
+        {"$match": {"_id": {"$gte": from_dt, "$lte": to_dt}}},
+        {"$addFields": {
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count":    {"$ifNull": ["$late_count", 0]},
+        }},
+        # ---- 4. Per-day headcount (R9) --------------------------------------
+        {"$lookup": {
+            "from": "employees",
+            "let":  {"day": "$_id"},
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [
+                    {"$eq": ["$department", department]},
+                    {"$lte": [{"$toDate": "$joined_on"}, "$$day"]},
+                ]}}},
+                {"$count": "n"},
+            ],
+            "as": "hc",
+        }},
+        {"$addFields": {
+            "headcount": {"$ifNull": [{"$arrayElemAt": ["$hc.n", 0]}, 0]},
+        }},
+        # ---- 5. is_working_day / attendance_rate (4dp half-up) -------------
+        {"$addFields": {
+            "is_working_day": {"$and": [
+                {"$gte": [{"$dayOfWeek": "$_id"}, 2]},
+                {"$lte": [{"$dayOfWeek": "$_id"}, 6]},
+            ]},
+        }},
+        {"$addFields": {
+            "attendance_rate": {"$cond": [
+                {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                # manual half-up rounding to 4dp: floor(x*1e4 + 0.5) / 1e4
+                {"$divide": [
+                    {"$floor": {"$add": [
+                        {"$multiply": [
+                            {"$divide": ["$present_count", "$headcount"]}, 10000,
+                        ]},
+                        0.5,
+                    ]}},
+                    10000,
+                ]},
+                None,
+            ]},
+        }},
+        # ---- 6. Moving average over 7-day window (non-null rates only) -----
+        {"$setWindowFields": {
+            "sortBy": {"_id": 1},
+            "output": {
+                "moving_avg_7d": {
+                    "$avg": "$attendance_rate",
+                    "window": {"documents": [-6, 0]},    # current + up to 6 preceding rows
+                },
+            },
+        }},
+        {"$project": {
+            "_id": 0,
+            "date":           {"$dateToString": {"format": "%Y-%m-%d", "date": "$_id"}},
+            "is_working_day": 1,
+            "headcount":      1,
+            "present_count":  1,
+            "late_count":     1,
+            "attendance_rate": 1,
+            "moving_avg_7d":  1,
+        }},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: DateStr = Query(..., alias="from"),
+    to: DateStr = Query(...),
+):
+    from_d = date.fromisoformat(from_)
+    to_d = date.fromisoformat(to)
+    if to_d < from_d:
+        raise HTTPException(422, "to must not be before from")
+    if (to_d - from_d).days + 1 > 92:
+        raise HTTPException(422, "range exceeds 92 days")
+
+    if employees_col.find_one({"department": department}) is None:
+        raise HTTPException(404, "unknown department")
+
+    rows = list(employees_col.aggregate(
+        _department_trend_pipeline(department, from_, to)
+    ))
+    items = [{
+        "date":           r["date"],
+        "is_working_day": bool(r["is_working_day"]),
+        "headcount":      int(r["headcount"]),
+        "present_count":  round_half_up(Decimal(str(r["present_count"])), 2),
+        "late_count":     int(r["late_count"]),
+        "attendance_rate": None if r["attendance_rate"] is None
+                            else round_half_up(r["attendance_rate"], 4),
+        "moving_avg_7d":   None if r["moving_avg_7d"] is None
+                            else round_half_up(r["moving_avg_7d"], 4),
+    } for r in rows]
+    return {"department": department, "items": items}

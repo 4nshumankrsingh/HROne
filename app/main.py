@@ -428,3 +428,75 @@ def list_attendance(
         cur = logs_col.find(q).sort(ATTENDANCE_SORT).skip(skip).limit(page_size)
         items = [record_to_api(d) for d in cur]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+# --- attendance: regularize (manual correction) ----------------------------
+class RegularizeRequest(BaseModel):
+    status: Optional[StatusLit] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: Annotated[str, StringConstraints(min_length=5, max_length=200)]
+    regularized_by: Annotated[str, StringConstraints(min_length=1, max_length=50)]
+
+    @model_validator(mode="after")
+    def _no_explicit_nulls(self):
+        for f in ("status", "punch_in", "punch_out"):
+            if f in self.model_fields_set and getattr(self, f) is None:
+                raise ValueError(f"{f} must not be null")
+        return self
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: DateStr, body: RegularizeRequest):
+    emp = employees_col.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    rec = logs_col.find_one({"emp_code": emp_code, "date": date})
+    if rec is None:
+        raise HTTPException(404, "no attendance record for that date")
+
+    old_status, old_in, old_out = rec["status"], rec.get("punch_in"), rec.get("punch_out")
+    new_status = body.status if body.status is not None else old_status
+    sup_in = truncate_seconds(ms_to_dt(body.punch_in)) if body.punch_in is not None else None
+    sup_out = truncate_seconds(ms_to_dt(body.punch_out)) if body.punch_out is not None else None
+
+    if new_status in ("ABSENT", "LEAVE"):
+        if sup_in is not None or sup_out is not None:
+            raise HTTPException(422, "ABSENT/LEAVE clear the punch times; do not supply them")
+        new_in = new_out = None
+    else:
+        new_in = sup_in if sup_in is not None else old_in
+        new_out = sup_out if sup_out is not None else old_out
+        if new_in is None:
+            raise HTTPException(422, "a presence status requires a punch_in")
+        if attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != date:
+            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+        if new_out is not None and (new_out <= new_in or (new_out - new_in).total_seconds() > MAX_SHIFT_SECONDS):
+            raise HTTPException(422, "punch_out must be after punch_in and within 24 hours of it")
+
+    if (new_status, new_in, new_out) == (old_status, old_in, old_out):
+        raise HTTPException(422, "the request changes nothing")
+
+    derived = derive_fields(new_status, new_in, new_out, date, emp["shift_start"], emp["shift_end"])
+    old_vals = {
+        "status": old_status, "punch_in": old_in, "punch_out": old_out,
+        "work_hours": rec.get("work_hours"), "late_minutes": rec.get("late_minutes") or 0,
+        "overtime_minutes": rec.get("overtime_minutes") or 0, "half_day": bool(rec.get("half_day", False)),
+    }
+    new_vals = {"status": new_status, "punch_in": new_in, "punch_out": new_out, **derived}
+    changes = {k: {"from": old_vals[k], "to": v} for k, v in new_vals.items() if v != old_vals[k]}
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+
+    # Compare-and-set on the state we read: a concurrent edit makes this match nothing -> 409,
+    # so no history entry is ever silently lost or overwritten.
+    has_history = isinstance(rec.get("history"), list)
+    old_history = rec["history"] if has_history else []
+    cas: dict[str, Any] = {
+        "_id": rec["_id"], "status": old_status, "punch_in": old_in, "punch_out": old_out,
+        "history": {"$size": len(old_history)} if has_history else {"$exists": False},
+    }
+    res = logs_col.update_one(cas, {"$set": new_vals, "$push": {"history": entry}})
+    if res.matched_count == 0:
+        raise HTTPException(409, "record was modified concurrently; retry")
+    rec.update(new_vals)
+    rec["history"] = old_history + [entry]
+    return record_to_api(rec)
